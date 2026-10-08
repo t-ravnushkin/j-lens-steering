@@ -15,6 +15,7 @@ from jlens.jspace_steering import (
     JDictionary,
     calibrate_residual_norm,
     comparison_vectors,
+    encode_chat_prompts,
     generate_comparison,
     sparse_j_component,
     summarize_reviews,
@@ -268,7 +269,11 @@ def test_notebook_runner_cache_reviews_and_widgets(gemma, tmp_path, monkeypatch)
     exec(source[1], env)  # imports/configuration
     exec(source[3], env)  # load disabled: define cache/chat utilities
     model, adapter, tokenizer = gemma
-    tokenizer.apply_chat_template = lambda messages, **kwargs: [1, 5, 6, 3]
+    from transformers import BatchEncoding
+
+    tokenizer.apply_chat_template = lambda messages, **kwargs: BatchEncoding(
+        {"input_ids": [1, 5, 6, 3], "attention_mask": [1, 1, 1, 1]}
+    )
     env["CFG"].update(layer=1, device="cpu", dtype="float32")
     env["CFG"]["batch_size"] = 5
     path = tmp_path / "params.npz"
@@ -332,3 +337,126 @@ def test_notebook_runner_cache_reviews_and_widgets(gemma, tmp_path, monkeypatch)
     env["CFG"]["layer"] = 2
     with pytest.raises(RuntimeError, match="CFG changed"):
         env["run_comparison"](prompts, feature=0, k=3, max_new_tokens=3)
+
+
+@pytest.mark.parametrize("container", ["list", "mapping", "tensor"])
+def test_chat_token_ids_are_json_safe_and_checked_by_token_count(container):
+    import json
+
+    from transformers import BatchEncoding
+
+    calls = []
+
+    def template(messages, **kwargs):
+        calls.append(kwargs)
+        ids = [1, 4, 5, 3]
+        if container == "mapping":
+            return BatchEncoding({"input_ids": ids, "attention_mask": [1] * 4})
+        if container == "tensor":
+            return {"input_ids": torch.tensor([ids])}
+        return ids
+
+    tokenizer = SimpleNamespace(apply_chat_template=template)
+    ids = encode_chat_prompts(tokenizer, ["Example"], max_seq_len=4)
+    assert json.loads(json.dumps({"calibration_ids": ids}))["calibration_ids"] == [
+        [1, 4, 5, 3]
+    ]
+    assert calls[0]["return_dict"] is False and calls[0]["truncation"] is False
+    with pytest.raises(ValueError, match="overlength"):
+        encode_chat_prompts(tokenizer, ["Example"], max_seq_len=3)
+
+
+def test_stop_diagnostics_preserve_generation_and_match_native_probabilities(gemma):
+    from jlens.jspace_steering import summarize_generation
+
+    model, adapter, tokenizer = gemma
+    model.generation_config.eos_token_id = [2, 3]
+    seqs = [[1, 5], [1, 6, 7]]
+    options = dict(layer=1, strength=0, reference_norm=1, max_new_tokens=4)
+    plain = generate_comparison(
+        model, adapter, tokenizer, seqs, ["baseline"], torch.zeros(1, 16), **options
+    )
+    traced = generate_comparison(
+        model,
+        adapter,
+        tokenizer,
+        seqs,
+        ["baseline"],
+        torch.zeros(1, 16),
+        record_stop_probabilities=True,
+        **options,
+    )
+    assert plain.generated_ids.tolist() == traced.generated_ids.tolist()
+    for row in traced.itertuples():
+        with torch.inference_mode():
+            logits = model(torch.tensor([seqs[row.item]])).logits[0, -1].float()
+        expected = logits.softmax(-1)[[2, 3]].sum().item()
+        assert row.stop_probability_trace[0] == pytest.approx(expected, rel=1e-5)
+        assert len(row.stop_probability_trace) == row.n_generated_tokens
+        assert 0 <= row.repeated_trigram_fraction <= 1
+        assert row.n_content_tokens <= row.n_generated_tokens
+    summary = summarize_generation(traced).iloc[0]
+    assert summary.native_stop_rate + summary.token_cap_rate == 1
+    assert not model._forward_hooks
+
+
+def test_stop_diagnostic_hook_removed_on_error(gemma, monkeypatch):
+    model, adapter, tokenizer = gemma
+
+    def fail(**kwargs):
+        raise RuntimeError("deliberate")
+
+    monkeypatch.setattr(model, "generate", fail)
+    with pytest.raises(RuntimeError, match="deliberate"):
+        generate_comparison(
+            model,
+            adapter,
+            tokenizer,
+            [[1, 5]],
+            ["baseline"],
+            torch.zeros(1, 16),
+            layer=1,
+            strength=0,
+            reference_norm=1,
+            record_stop_probabilities=True,
+        )
+    assert not model._forward_hooks and not model._forward_pre_hooks
+    assert not adapter.layers[1]._forward_hooks
+
+
+def test_mixed_stop_and_cap_traces_are_trimmed_and_json_safe(gemma):
+    import json
+
+    model, adapter, tokenizer = gemma
+    model.generation_config.eos_token_id = [2, 3]
+
+    def force_mixed(module, args, output):
+        output.logits[:] = -100
+        output.logits[0, :, 3] = 100
+        output.logits[1, :, 7] = 100
+        return output
+
+    handle = model.register_forward_hook(force_mixed)
+    try:
+        result = generate_comparison(
+            model,
+            adapter,
+            tokenizer,
+            [[1, 5], [1, 6]],
+            ["baseline"],
+            torch.zeros(1, 16),
+            layer=1,
+            strength=0,
+            reference_norm=1,
+            max_new_tokens=6,
+            record_stop_probabilities=True,
+        )
+    finally:
+        handle.remove()
+    stopped, capped = result.to_dict("records")
+    json.dumps(result.to_dict("records"), allow_nan=False)
+    assert stopped["stop_token_id"] == 3 and capped["stop_token_id"] is None
+    assert stopped["stop_probability_trace"] == [1.0]
+    assert len(capped["stop_probability_trace"]) == 6
+    assert stopped["n_content_tokens"] == 0 and capped["n_content_tokens"] == 6
+    assert capped["repeated_trigram_fraction"] == 0.75

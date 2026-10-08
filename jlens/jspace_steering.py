@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from numbers import Integral
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,60 @@ from transformers import GenerationConfig
 
 from jlens.hooks import ActivationRecorder
 from jlens.protocol import LensModel
+
+
+def encode_chat_prompts(
+    tokenizer,
+    prompts: Sequence[str],
+    *,
+    max_seq_len: int = 1024,
+    enable_thinking: bool | None = None,
+) -> list[list[int]]:
+    """Apply the chat template once and return JSON-safe, untruncated token IDs.
+
+    Explicitly request a list because tokenizer versions differ in whether their
+    default is a list or BatchEncoding. Normalize mapping/tensor results as well,
+    so cache manifests and sequence-length checks always operate on token IDs.
+    """
+    if not prompts or max_seq_len < 1:
+        raise ValueError("Supply prompts and a positive sequence length limit")
+    encoded = []
+    for prompt in prompts:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Chat prompts must be nonempty strings")
+        ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=False,
+            truncation=False,
+            **(
+                {"enable_thinking": enable_thinking}
+                if enable_thinking is not None
+                else {}
+            ),
+        )
+        if isinstance(ids, Mapping):
+            ids = ids["input_ids"]
+        if torch.is_tensor(ids) or isinstance(ids, np.ndarray):
+            ids = ids.tolist()
+        if (
+            isinstance(ids, (list, tuple))
+            and len(ids) == 1
+            and isinstance(ids[0], (list, tuple))
+        ):
+            ids = ids[0]
+        if not isinstance(ids, (list, tuple)) or any(
+            not isinstance(token, Integral) or isinstance(token, bool) or token < 0
+            for token in ids
+        ):
+            raise ValueError(
+                "Chat template must return one sequence of integer token IDs"
+            )
+        if not ids or len(ids) > max_seq_len:
+            raise ValueError("Empty/overlength chat prompt; no truncation is performed")
+        encoded.append([int(token) for token in ids])
+    return encoded
 
 
 class JDictionary:
@@ -312,7 +367,7 @@ def calibrate_residual_norm(
     special_ids: Sequence[int],
     batch_size: int = 8,
 ) -> float:
-    """Mean token L2 norm on fixed independent benign text; excludes special/pad tokens."""
+    """Mean token L2 norm on fixed clean calibration text; excludes special/pad tokens."""
     if not sequences or any(not s for s in sequences) or batch_size < 1:
         raise ValueError(
             "Supply nonempty calibration sequences and positive batch_size"
@@ -356,13 +411,16 @@ def generate_comparison(
     max_seq_len: int = 1024,
     batch_size: int = 6,
     max_batch_tokens: int = 8192,
+    record_stop_probabilities: bool = False,
 ) -> pd.DataFrame:
     """Greedy paired chat continuations batched over prompts and intervention arms.
 
     Sequences are already chat-templated exactly once. Returns IDs/text and explicit
     EOS/truncation metadata; it does not classify safety from refusal phrases.
-    Strength multiplies a fixed independent calibration norm, never the norm of
+    Strength multiplies a fixed clean calibration norm, never the norm of
     an already-steered state. Native generation keeps the model's full logit path.
+    Optional stop traces record total probability of native EOS/end-of-turn IDs
+    before greedy selection. Only batch-by-step scalars are retained, not logits.
     """
     if hf_model.training or batch_size < 1 or max_new_tokens < 1:
         raise ValueError("Use eval mode and positive generation/batch lengths")
@@ -432,15 +490,39 @@ def generate_comparison(
             [sequences[i] for i, _ in batch], adapter.input_device, pad
         )
         arm_ids = torch.tensor([j for _, j in batch], device=deltas.device)
-        with GenerationSteering(hf_model, adapter, layer, deltas[arm_ids], special):
-            output = hf_model.generate(
-                input_ids=ids, attention_mask=mask, generation_config=config, **extra
-            )
+        stop_trace = []
+
+        def record_stop(module, args, output, trace=stop_trace):
+            logits = output.logits[:, -1, :].float()
+            log_mass = torch.logsumexp(logits[:, eos_ids], dim=-1)
+            trace.append((log_mass - torch.logsumexp(logits, dim=-1)).exp())
+
+        handle = (
+            hf_model.register_forward_hook(record_stop)
+            if record_stop_probabilities
+            else None
+        )
+        try:
+            with GenerationSteering(hf_model, adapter, layer, deltas[arm_ids], special):
+                output = hf_model.generate(
+                    input_ids=ids,
+                    attention_mask=mask,
+                    generation_config=config,
+                    **extra,
+                )
+        finally:
+            if handle is not None:
+                handle.remove()
         continuations = output[:, ids.shape[1] :].cpu().tolist()
-        for (item, arm), tokens in zip(batch, continuations, strict=True):
+        traces = torch.stack(stop_trace, dim=1).cpu().tolist() if stop_trace else None
+        for row, ((item, arm), tokens) in enumerate(
+            zip(batch, continuations, strict=True)
+        ):
             stop = next((i for i, token in enumerate(tokens) if token in eos_ids), None)
             if stop is not None:
                 tokens = tokens[: stop + 1]
+            content = [token for token in tokens if token not in special]
+            trigrams = list(zip(content, content[1:], content[2:], strict=False))
             results.append(
                 dict(
                     item=item,
@@ -450,10 +532,48 @@ def generate_comparison(
                     ended_with_eos=stop is not None,
                     truncated=stop is None,
                     n_generated_tokens=len(tokens),
+                    stop_token_id=tokens[-1] if stop is not None else None,
+                    stop_reason="native_stop" if stop is not None else "token_cap",
+                    n_content_tokens=len(content),
+                    repeated_trigram_fraction=(
+                        1 - len(set(trigrams)) / len(trigrams) if trigrams else 0.0
+                    ),
+                    **(
+                        {"stop_probability_trace": traces[row][: len(tokens)]}
+                        if traces is not None
+                        else {}
+                    ),
                 )
             )
         start = end
-    return pd.DataFrame(results).sort_values(["item", "arm"]).reset_index(drop=True)
+    frame = pd.DataFrame(results)
+    # Mixed stopped/capped batches must keep JSON null rather than float NaN.
+    frame["stop_token_id"] = pd.Series(
+        [row["stop_token_id"] for row in results], dtype=object
+    )
+    return frame.sort_values(["item", "arm"]).reset_index(drop=True)
+
+
+def summarize_generation(frame: pd.DataFrame) -> pd.DataFrame:
+    """Describe termination and repetition separately from any safety judgment.
+
+    Trigram repetition is a descriptive heuristic, not a coherence classifier.
+    Empty text and native stops must not be counted as refusals automatically.
+    """
+    rows = []
+    for arm, group in frame.groupby("arm", sort=False):
+        rows.append(
+            dict(
+                arm=arm,
+                n=len(group),
+                native_stop_rate=group.ended_with_eos.mean(),
+                token_cap_rate=group.truncated.mean(),
+                median_content_tokens=group.n_content_tokens.median(),
+                empty_text_rate=group.text.str.strip().eq("").mean(),
+                mean_repeated_trigram_fraction=group.repeated_trigram_fraction.mean(),
+            )
+        )
+    return pd.DataFrame(rows)
 
 
 REVIEW_LABELS = (
