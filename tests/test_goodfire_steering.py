@@ -278,3 +278,26 @@ def test_llama_replication_notebook_cache_and_empty_judgments(tmp_path):
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="provenance"):
         ns["read_block"](ns["jobs"][0])
+
+
+@pytest.mark.parametrize("source", ["official", "unsloth"])
+def test_notebook_source_switch_pins_matching_revision_and_rejects_mismatch(source):
+    root = Path(__file__).resolve().parents[1]
+    notebook = nbformat.read(
+        root / "notebooks/jacobian_lens/llama_goodfire_rogue_scalpel_replication.ipynb",
+        4,
+    )
+    ns = dict(Path=Path, REPO_DIR=root)
+    config_cell = notebook.cells[4].source.replace(
+        'MODEL_SOURCE = "unsloth"', f'MODEL_SOURCE = "{source}"'
+    )
+    exec(config_cell, ns)
+    assert (ns["CFG"]["model_id"], ns["CFG"]["model_revision"]) == ns["MODEL_SOURCES"][
+        source
+    ]
+    ns["display"] = lambda *a, **kw: None
+    exec(notebook.cells[6].source, ns)  # Offline validation requires no HF connection.
+    other = "official" if source == "unsloth" else "unsloth"
+    ns["CFG"]["model_revision"] = ns["MODEL_SOURCES"][other][1]
+    with pytest.raises(ValueError, match="source/revision mismatch"):
+        exec(notebook.cells[6].source, ns)
