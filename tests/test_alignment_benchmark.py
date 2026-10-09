@@ -301,6 +301,7 @@ def test_benchmark_notebook_stage_caches_resume_and_keep_audit_blinded(tmp_path)
     loads = []
 
     def load_model(*args, **kwargs):
+        assert kwargs["attn_implementation"] == "sdpa"
         loads.append(1)
         return model
 
@@ -312,6 +313,9 @@ def test_benchmark_notebook_stage_caches_resume_and_keep_audit_blinded(tmp_path)
     ns["JUDGE"]["device"] = "cpu"
     exec(notebook.cells[13].source, ns)
     assert len(loads) == 1
+    assert max(model.batches) == 16
+    assert all(size <= 16 for size in model.batches)
+    assert sum(model.batches) == len(ns["items"]) * len(ns["conditions"])
     exec(notebook.cells[13].source, ns)
     assert len(loads) == 1  # Cached judging must not load weights again.
     exec(notebook.cells[15].source, ns)
@@ -333,3 +337,73 @@ def test_benchmark_notebook_stage_caches_resume_and_keep_audit_blinded(tmp_path)
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="provenance"):
         ns["read_block"](ns["jobs"][0])
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["missing", "empty_calibration", "changed", "offline_override", "overlength"],
+)
+def test_benchmark_loader_preflight_before_weights(state, tmp_path):
+    from pathlib import Path
+
+    import nbformat
+
+    root = Path(__file__).resolve().parents[1]
+    notebook = nbformat.read(
+        root / "notebooks/jacobian_lens/jspace_sae_rogue_scalpel_benchmark.ipynb",
+        as_version=4,
+    )
+    ns = {"Path": Path, "REPO_DIR": root}
+    exec(notebook.cells[4].source, ns)
+    ns["CFG"]["device"] = "cpu"
+    items = pd.DataFrame([dict(kind="harmful", prompt="Explain a benign test topic.")])
+    if state == "empty_calibration":
+        items["kind"] = "benign"
+    conditions = make_conditions([0], [1], [1.0])
+    plan = dict(
+        model=ns["CFG"],
+        study=ns["STUDY"],
+        items=items.to_dict("records"),
+        conditions=conditions.to_dict("records"),
+    )
+    ns.update(
+        MODE="generate",
+        PLAN=plan,
+        plan_id=digest(plan),
+        items=items,
+        conditions=conditions,
+        RUN_DIR=tmp_path,
+        jobs=[(0, 1, 0, 1)],
+        read_block=lambda job: None,
+    )
+    downloads = []
+
+    def load_tokenizer(*args, **kwargs):
+        downloads.append("tokenizer")
+        return SimpleNamespace(apply_chat_template=lambda *a, **kw: [1] * 2049)
+
+    def load_weights(*args, **kwargs):
+        downloads.append("weights")
+        pytest.fail("Preflight must finish before any model-weight download")
+
+    ns["AutoTokenizer"] = SimpleNamespace(from_pretrained=load_tokenizer)
+    ns["AutoModelForCausalLM"] = SimpleNamespace(from_pretrained=load_weights)
+    ns["hf_hub_download"] = load_weights
+    if state == "offline_override":
+        ns.update(MODE="offline", LOAD_MODEL=True, PLAN=None, items=None)
+        exec(notebook.cells[8].source, ns)
+        assert not ns["LOAD_MODEL"] and not downloads
+        return
+    if state == "missing":
+        ns.update(PLAN=None, items=None)
+        match = "No generation plan"
+    elif state == "empty_calibration":
+        match = "no valid harmful calibration prompts"
+    elif state == "changed":
+        ns["CFG"]["max_seq_len"] += 1
+        match = "settings/items changed"
+    else:
+        match = "overlength"
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        exec(notebook.cells[8].source, ns)
+    assert downloads == (["tokenizer"] if state == "overlength" else [])
