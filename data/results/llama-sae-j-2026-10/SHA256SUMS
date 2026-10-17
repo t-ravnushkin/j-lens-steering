@@ -1,0 +1,9 @@
+07b160f8f5cb9d70a101c1ed7aeb1150c9c7748df191a80c4693db68eb2216e7  data/results/llama-sae-j-2026-10/README.md
+06b5c019153eef4de2003de478a19c42844fa47ea43c3c80eec67401950fde7e  data/results/llama-sae-j-2026-10/component-analysis.md
+583488c1a2788ccb0db6a69377b3d40a89fb70c1dea04000b63cd82c15f81bf7  data/results/llama-sae-j-2026-10/j-topk-all.csv
+e4d86e9883a5c9e8249a9da35722146481104c95235cfcb1fab7f2b596b274af  data/results/llama-sae-j-2026-10/j-topk-all.json
+98b7d7a412466cc2646e56cca9960e8ca25a970024fe5e543cd4e2b3eac22ecd  data/results/llama-sae-j-2026-10/j-topk-all.md
+495e0f7b0ec5b3e191cc1558055b0888875eec615584e2b242c0ab08c9d3ecb6  data/results/llama-sae-j-2026-10/pairs.csv
+ca74cc11c731f932ae3b2828d12cef74ad0a3bb73207a7988de45803bcf59c01  data/results/llama-sae-j-2026-10/provenance.json
+f9daf13421d99e4528aaa68fc5ca01f18f66fbbf881a2d65075402be1bcdc8ef  data/results/llama-sae-j-2026-10/results.json
+2faa6801b040914e8a2cc69e5f45e524173ab823906df8d31cffe785e6028523  notebooks/jacobian_lens/llama_sae_j_retained_results.ipynb

@@ -1,0 +1,14 @@
+{
+  "schema": "sae-j-results.provenance.v1",
+  "prepared_date": "2026-10-17",
+  "experiment_date": "2026-10-16",
+  "export_type": "field-allowlisted derivative, not complete original report",
+  "source_sha256": {
+    "full540_report": "74a8ecd57b9d13ed86773709e2633d2da77c8d82eaaeeb87f3859508b3424639",
+    "full_token_export": "e4d86e9883a5c9e8249a9da35722146481104c95235cfcb1fab7f2b596b274af",
+    "geometry": "4811b44b4743167157384d50a3465fa714b674ee23a3de2a6e3328707ee5d03a",
+    "tokenizer_json": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4"
+  },
+  "source_availability": "Original full report and private experiment evidence retained by research owner; private records not included or publicly resolvable here. Hashes prove identity only, not semantic validity.",
+  "scope": "Labels/pair identities/token-identity flags are unchanged; all component export files are byte-identical to original exports; README and component summary are newly authored."
+}
